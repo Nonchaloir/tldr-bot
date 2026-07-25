@@ -1,0 +1,93 @@
+# docker-compose.yml
+# Runs both containers together with one command: docker-compose up
+#
+# Two services:
+#   api       — FastAPI backend with GPU access, port 8000
+#   streamlit — Streamlit frontend, port 8501
+#
+# Three volumes mounted from your Windows machine into the containers:
+#   chroma_db/       — ChromaDB persists document chunks across restarts
+#   chat_history.db  — SQLite chat history persists across restarts
+#   HuggingFace cache — model weights reused from your local download
+#                       so the container doesn't re-download on every start
+
+services:
+
+  api:
+    # Build the API container using Dockerfile.api
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+
+    # Map port 8000 on your Windows machine to port 8000 inside the container
+    # Format is "host_port:container_port"
+    # Without this you can't reach FastAPI from your browser or from Streamlit
+    ports:
+      - "8000:8000"
+
+    # GPU passthrough — gives the container access to all available GPUs
+    # This is what nvidia-container-toolkit enables
+    # Without this block the container runs on CPU only
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    volumes:
+      # Mount chroma_db from your project folder into the container
+      # ./chroma_db is relative to where docker-compose.yml sits (your project root)
+      # /app/chroma_db is where api.py expects it inside the container
+      - ./chroma_db:/app/chroma_db
+
+      # Mount the SQLite file directly — single file mount
+      - ./chat_history.db:/app/chat_history.db
+
+      # Mount your Windows HuggingFace cache into the container
+      # This means the container reuses already-downloaded model weights
+      # instead of re-downloading Qwen2.5 (several GB) every time it starts
+      # Change "justi" to your actual Windows username if different
+      - C:\Users\justi\.cache\huggingface:/root/.cache/huggingface
+
+    # Environment variables passed into the container
+    # These override what's in .env if there's a conflict
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+    # Streamlit container won't start until the API container is healthy
+    # Without this Streamlit might start before FastAPI is ready and fail to connect
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+    # Restart the container automatically if it crashes
+    restart: unless-stopped
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+
+    ports:
+      - "8501:8501"
+
+    # Wait for API to be healthy before starting
+    # depends_on alone doesn't wait for the app inside to be ready —
+    # condition: service_healthy waits for the healthcheck to pass
+    depends_on:
+      api:
+        condition: service_healthy
+
+    environment:
+      # Tell Streamlit where to find the API
+      # "api" is the service name above — Docker's internal DNS resolves it
+      # to the API container's IP automatically, so we don't need localhost
+      - API_URL=http://api:8000
+
+    restart: unless-stopped

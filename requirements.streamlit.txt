@@ -1,0 +1,8 @@
+# requirements.streamlit.txt
+# Only the packages the Streamlit container needs
+# No torch, transformers, peft, bitsandbytes — those live in the API container
+# Keeping this separate makes the Streamlit image fast to build and small
+
+streamlit
+requests
+python-dotenv

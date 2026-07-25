@@ -1,0 +1,69 @@
+# Dockerfile.api — builds the FastAPI backend container
+#
+# pytorch/pytorch base image comes with CUDA, cuDNN, and Python pre-installed
+# This avoids having to manually install Python on top of a CUDA image
+# 2.7.0-cuda12.8-cudnn9-runtime matches cu128 which supports sm_120 (RTX 5070)
+FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
+
+# Stop Python from writing .pyc files and force stdout/stderr to be unbuffered
+# so logs appear immediately in docker-compose output instead of being buffered
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install system dependencies only — Python and pip are already in the base image
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first — Docker caches each layer separately
+# If requirements.txt hasn't changed, this layer is reused and pip
+# install is skipped on rebuild, making rebuilds much faster
+COPY requirement.txt .
+
+# Install PyTorch nightly with cu128 first — needed for RTX 5070 sm_120 support
+# Installed before everything else so it doesn't get overwritten by requirements.txt
+RUN pip install --pre torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/nightly/cu128
+
+# Install bitsandbytes separately
+RUN pip install bitsandbytes --upgrade
+
+# Install all other dependencies explicitly
+# These are split from torch to avoid the --extra-index-url line causing issues
+RUN pip install \
+    streamlit \
+    pdfplumber \
+    easyocr \
+    pillow \
+    numpy \
+    fastapi \
+    uvicorn \
+    requests \
+    pydantic \
+    chromadb \
+    sentence-transformers \
+    python-dotenv \
+    transformers \
+    peft \
+    accelerate \
+    huggingface_hub \
+    langchain \
+    langchain-core \
+    langchain-community \
+    langchain-chroma \
+    langchain-huggingface \
+    langchain-text-splitters
+
+# Copy the project files into the container
+COPY api.py .
+COPY .env .
+
+# Expose port 8000 so docker-compose and the host machine can reach FastAPI
+EXPOSE 8000
+
+# --host 0.0.0.0 makes FastAPI listen on all network interfaces inside the container
+# Without this it only listens on localhost inside the container and nothing can reach it
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]

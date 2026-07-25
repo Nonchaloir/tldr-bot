@@ -1,0 +1,34 @@
+# Dockerfile.streamlit — builds the Streamlit frontend container
+#
+# Streamlit doesn't need CUDA — it's just a UI that makes HTTP requests
+# to the FastAPI container. Plain Python is fine here, which keeps
+# this image small and fast to build.
+FROM python:3.12-slim
+
+# Stop Python from writing .pyc files and force unbuffered output
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Copy and install only what Streamlit needs
+# It doesn't need torch, transformers, peft, bitsandbytes, or any AI libraries
+# — those all live in the API container
+COPY requirements.streamlit.txt .
+RUN pip install -r requirements.streamlit.txt
+
+# Copy just the UI files — api.py stays in the API container
+COPY Home.py .
+COPY pages/ pages/
+
+# Expose port 8501 — Streamlit's default port
+EXPOSE 8501
+
+# --server.address=0.0.0.0 makes Streamlit listen on all interfaces
+# --server.headless=true disables the browser auto-open (no browser inside a container)
+# --server.fileWatcherType=none disables file watching (not needed in production)
+CMD ["streamlit", "run", "Home.py", \
+     "--server.address=0.0.0.0", \
+     "--server.port=8501", \
+     "--server.headless=true", \
+     "--server.fileWatcherType=none"]

@@ -1,0 +1,30 @@
+# .dockerignore
+# Files and folders excluded from the Docker build context
+# Same idea as .gitignore — keeps the image lean and prevents secrets leaking
+
+# Virtual environment — never copy this, the container installs its own
+venv/
+.venv/
+env/
+
+# ChromaDB and SQLite — these are mounted as volumes, not copied into the image
+# Copying them would bake stale data into the image
+chroma_db/
+chat_history.db
+
+# Python cache files — not needed inside the container
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Git history — not needed at runtime
+.git/
+.gitignore
+
+# HuggingFace cache — mounted as a volume, not copied
+.cache/
+
+# Docker files themselves — no need to copy these into the image
+Dockerfile*
+docker-compose.yml
