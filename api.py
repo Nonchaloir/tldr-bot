@@ -1,15 +1,15 @@
 """
 Document & Image Summarizer — FastAPI Backend
-Step 8: SQLite chat history.
+Multi-user update: each browser session gets its own isolated history and memory.
 
 What changed:
-  - sqlite3 database added to persist chat history across sessions
-  - init_db() creates the messages table on startup if it doesn't exist
-  - GET /history — returns all past messages from SQLite
-  - DELETE /history — clears all messages from SQLite
-  - /chat and /chat/stream now write to SQLite after each exchange
-  - InMemoryChatMessageHistory is now seeded from SQLite on startup
-    so in-session memory and on-disk history stay in sync
+  - messages table now has session_id column to isolate per-user history
+  - db_save_message(), db_load_messages(), db_clear_messages() all filter by session_id
+  - Global memory replaced with session_memories dict — one InMemoryChatMessageHistory per session
+  - get_memory() creates and seeds memory per session on first use
+  - ChatRequest and StoreRequest now include session_id
+  - GET /history, DELETE /history, /chat, /chat/stream all accept session_id
+  - /store tags ChromaDB chunks with session_id so document context is isolated per user
 
 Run with: uvicorn api:app --reload
 """
@@ -64,7 +64,7 @@ from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
 # InMemoryChatMessageHistory — stores the last N messages from the current session
-# Seeded from SQLite on startup so memory is restored after a restart
+# Now created per session instead of one global object
 
 ## Tracks and retrain message history in memory for duration of an ACTIVE SESSION
 from langchain_core.chat_history import InMemoryChatMessageHistory
@@ -92,7 +92,7 @@ MAX_CHAT_TOKENS = 350
 
 ## When doing summary, our model has to do more work and reply more, hence we set more Tokens for it
 ## The model stops generating words or stops after it hits the limit of 1500 tokens
-MAX_SUMMARY_TOKENS = 1500
+MAX_SUMMARY_TOKENS = 3000
 
 ## The model can only read up to about 30k tokens, hence if the document is more, we have to ensure that it falls within the token limit or else it will crash
 ## Variable is set so that we know the limit and ensure that it does not go above it
@@ -152,10 +152,11 @@ Then end with:
 Document:
 {text}""",
 
-    "Medium": """You are creating revision notes.
+    "Medium": """Read this document and explain the 3 most important concepts.
 
-FIRST:
-List every heading found in the document and write 5-10 bullet points explaining it.
+For each concept write:
+- What it is (2-3 sentences)
+- One example
 
 Document:
 {text}""",
@@ -191,42 +192,46 @@ def init_db():
     Called once at startup — safe to call every time because of IF NOT EXISTS.
 
     Table columns:
-      id        — auto-incrementing integer, unique row identifier
-      role      — "user" or "assistant"
-      content   — the message text
-      timestamp — automatically set to the current time when the row is inserted
+      id         — auto-incrementing integer, unique row identifier
+      session_id — which user/browser session this message belongs to
+      role       — "user" or "assistant"
+      content    — the message text
+      timestamp  — automatically set to the current time when the row is inserted
     """
     # connect() opens the database file, or creates it if it doesn't exist
     # The with block auto-commits on success and auto-rolls back on error
     with sqlite3.connect(DB_PATH) as conn:
 
         ## CREATE TABLE IF NOT EXISTS -> safe to execute everytime
+        ## session_id column added so each user's messages are stored separately
         conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                role      TEXT    NOT NULL,
-                content   TEXT    NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                id         INTEGER  PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT     NOT NULL,
+                role       TEXT     NOT NULL,
+                content    TEXT     NOT NULL,
+                timestamp  DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
-def db_save_message(role: str, content: str):
+def db_save_message(session_id: str, role: str, content: str):
     """
-    Inserts one message row into the messages table.
+    Inserts one message row into the messages table for a specific session.
     Called after every user question and every model answer.
     """
     # ? placeholders prevent SQL injection — values are passed separately
     with sqlite3.connect(DB_PATH) as conn:
 
-        ## Insert message into db with values of the role -> user/assistant and content -> message/reply
+        ## Insert message into db with the session_id so we know which user it belongs to
+        ## role -> user/assistant, content -> message/reply
         conn.execute(
-            "INSERT INTO messages (role, content) VALUES (?, ?)",
-            (role, content),
+            "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, role, content),
         )
 
-def db_load_messages() -> list[dict]:
+def db_load_messages(session_id: str) -> list[dict]:
     """
-    Returns all messages from the database in chronological order.
+    Returns all messages for a specific session in chronological order.
     Each row comes back as {"role": "user"/"assistant", "content": "..."}.
     """
     with sqlite3.connect(DB_PATH) as conn:
@@ -236,19 +241,22 @@ def db_load_messages() -> list[dict]:
         ## Converts query results from plain tuples -> dict like row objects
         ## Access column values by COLUMN NAME and by INDEX
         conn.row_factory = sqlite3.Row
+
+        ## WHERE session_id = ? filters so we only get messages for THIS user
         rows = conn.execute(
-            "SELECT role, content FROM messages ORDER BY id ASC"
+            "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id ASC",
+            (session_id,)
         ).fetchall()
 
         ## returns rows like {"role": _____________, "content": _____________________}
     return [{"role": row["role"], "content": row["content"]} for row in rows]
 
-def db_clear_messages():
-    """Deletes all rows from the messages table."""
+def db_clear_messages(session_id: str):
+    """Deletes all rows for a specific session from the messages table."""
     with sqlite3.connect(DB_PATH) as conn:
 
-        ## delete all messages by the user
-        conn.execute("DELETE FROM messages")
+        ## delete all messages for THIS user only, not everyone's messages
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
 
 # --------------------------------------------------------------------------
 # Load models at startup
@@ -351,22 +359,26 @@ vector_store = Chroma(
     collection_name="documents",
 )
 
-## Container object that holds a list of chat messages, which is assigned to variable memory
-## Stores the messages in computer's RAM so it remembers conversations
-## Seeded from SQLite on startup so the model has full history context immediately
-memory = InMemoryChatMessageHistory()
+# Per-session memory store — replaces the single global memory object
+# session_id (string) -> InMemoryChatMessageHistory
+# Each browser session gets its own isolated conversation memory
+session_memories: dict[str, InMemoryChatMessageHistory] = {}
 
-# Restore previous messages from SQLite into in-session memory
-# so the model has full conversation context from the moment the server starts
-# Without this, memory would be empty on every restart even though SQLite has the history
+def get_memory(session_id: str) -> InMemoryChatMessageHistory:
+    # If this session has no memory object yet, create one and seed it from SQLite
+    # This means even after a server restart, the model remembers past conversations
+    # for each individual user
+    if session_id not in session_memories:
+        memory = InMemoryChatMessageHistory()
 
-## Load previous messages
-## If exist, load them so the user can see past history conversation
-for msg in db_load_messages():
-    if msg["role"] == "user":
-        memory.add_message(HumanMessage(content=msg["content"]))
-    else:
-        memory.add_message(AIMessage(content=msg["content"]))
+        ## Load previous messages for THIS session from SQLite and add them into memory
+        for msg in db_load_messages(session_id):
+            if msg["role"] == "user":
+                memory.add_message(HumanMessage(content=msg["content"]))
+            else:
+                memory.add_message(AIMessage(content=msg["content"]))
+        session_memories[session_id] = memory
+    return session_memories[session_id]
 
 # --------------------------------------------------------------------------
 # Request / Response models (Pydantic)
@@ -382,10 +394,13 @@ class SummarizeRequest(BaseModel):
 class SummarizeResponse(BaseModel):
     summary: str
 
-## Streamlit (app.py) will send data in the form of a dictionary question
-## json={"question": question}
+## Streamlit (app.py) will send data in the form of a dictionary question + session_id
+## json={"question": question, "session_id": session_id}
+
+## session_id added so the API knows which user is asking the question
 class ChatRequest(BaseModel):
     question: str
+    session_id: str
 
 ## This is what our API will return back to Streamlit (app.py)
 ## response.json()["answer"]
@@ -394,10 +409,13 @@ class ChatResponse(BaseModel):
 
 ## New class for our ChromaDB
 ## Checks the validity of the data being sent FROM Streamlit TO the backend
-## Accepts data in the form of {"filename":_____, "text":______}
+## Accepts data in the form of {"filename":_____, "text":______, "session_id": ______}
+
+## session_id added so ChromaDB chunks are tagged per user
 class StoreRequest(BaseModel):
     filename: str
     text: str
+    session_id: str
 
 ## New class for our ChromaDB
 ## Will send back in the form of the dictionary {"chunks_stored": _____} to our frontend
@@ -510,34 +528,36 @@ async def health():
 
 
 # --------------------------------------------------------------------------
-# NEW: GET /history
-# Returns all past messages from SQLite so Streamlit can restore the chat
-# UI on startup without the user needing to re-ask everything
+# GET /history
+# Returns all past messages for a specific session from SQLite
+# Streamlit calls this on startup to restore the chat UI for that user
 # --------------------------------------------------------------------------
 @app.get("/history")
-async def get_history():
-    # db_load_messages() runs SELECT role, content FROM messages ORDER BY id ASC
-    # returns a list of dicts: [{"role": "user", "content": "..."}, ...]
+async def get_history(session_id: str):
+    # db_load_messages() runs SELECT ... WHERE session_id = ? ORDER BY id ASC
+    # returns only messages belonging to this session
 
-    ## Get all the past conversations from the db 
-    messages = db_load_messages()
+    ## Get all the past conversations from the db for THIS user only
+    messages = db_load_messages(session_id)
     return {"messages": messages}
 
 
 # --------------------------------------------------------------------------
-# NEW: DELETE /history
+# DELETE /history
 # Wired to the "Clear all" button in Streamlit
-# Clears both SQLite (on disk) and InMemoryChatMessageHistory (in RAM)
-# so history is gone from everywhere, not just the UI
+# Clears SQLite and in-session memory for this user only
+# Other users' history is not affected
 # --------------------------------------------------------------------------
 @app.delete("/history")
-async def clear_history():
-    # DELETE FROM messages — wipes all rows from the table
+async def clear_history(session_id: str):
+    # DELETE FROM messages WHERE session_id = ? — wipes only this user's rows
 
-    ## Delete ALL MESSAGES from the table
-    db_clear_messages()
-    # clear() resets the in-session memory list to empty
-    memory.clear()
+    ## Delete ALL MESSAGES for THIS user from the table
+    db_clear_messages(session_id)
+
+    # clear() resets this session's in-memory message list to empty
+    if session_id in session_memories:
+        session_memories[session_id].clear()
     return {"status": "cleared"}
 
 
@@ -582,15 +602,16 @@ async def extract(file: UploadFile = File(...)):
 
 
 # --------------------------------------------------------------------------
-# POST /store — LangChain chunking + ChromaDB, unchanged from Step 7
+# POST /store — now tags chunks with session_id so each user's documents
+# are isolated in ChromaDB and don't bleed into other users' searches
 # --------------------------------------------------------------------------
 @app.post("/store", response_model=StoreResponse)
 async def store(request: StoreRequest):
-    ## Check ChromaDB first — if this file is already stored, skip it
-    ## This prevents duplicate chunks when the app restarts and re-uploads the same file
-    existing = vector_store.get(where={"filename": request.filename})
+    ## Check ChromaDB first — if this file is already stored for this session, skip it
+    ## Use both filename AND session_id as the key so different users can upload the same file
+    existing = vector_store.get(where={"$and": [{"filename": request.filename}, {"session_id": request.session_id}]})
     if existing and existing.get("ids"):
-        print(f"[store] {request.filename} already in ChromaDB, skipping")
+        print(f"[store] {request.filename} already in ChromaDB for session {request.session_id}, skipping")
 
         ## already exist dont need to store again
         return StoreResponse(chunks_stored=0)
@@ -600,10 +621,10 @@ async def store(request: StoreRequest):
     # This replaces our manual chunk_text() + manual metadata dict
 
     ## as stated for text_splitter, splits the file details up into hierachy
-    ## we will use the filename as metadata
+    ## we will use the filename and session_id as metadata so chunks are isolated per user
     docs = text_splitter.create_documents(
         texts=[request.text],
-        metadatas=[{"filename": request.filename}],
+        metadatas=[{"filename": request.filename, "session_id": request.session_id}],
     )
 
     ## vector_store.add_documents() embeds each chunk and stores it in ChromaDB
@@ -656,13 +677,18 @@ async def summarize_stream(request: SummarizeRequest):
 
 # --------------------------------------------------------------------------
 # POST /chat — non-streaming fallback
-# Now also writes to SQLite after generating the answer
+# Now uses session_id to isolate memory and history per user
 # --------------------------------------------------------------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
+    # Get or create memory for this specific session
+    memory = get_memory(request.session_id)
+
     ## Vector database is being converted into a retrieval interface
-    ## When searched, return TOP 3 MOST SIMILAR DOCUMENT CHUNKS
-    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+    ## When searched, return TOP 3 MOST SIMILAR DOCUMENT CHUNKS for THIS user's documents
+    retriever = vector_store.as_retriever(
+        search_kwargs={"k": 3, "filter": {"session_id": request.session_id}}
+    )
 
     ## Query to the databsae, which embeds the user's input into a vector -> queries the database -> returns a list containing 3 matching Document Objects
     relevant_docs = retriever.invoke(request.question)
@@ -698,22 +724,27 @@ async def chat(request: ChatRequest):
 
     # Write both messages to SQLite so they survive a server restart
 
-    ## Now we also store the messages into our database (db)
+    ## Now we also store the messages into our database (db) tagged with session_id
     ## Store BOTH user + assistant answer in
-    db_save_message("user", request.question)
-    db_save_message("assistant", answer)
+    db_save_message(request.session_id, "user", request.question)
+    db_save_message(request.session_id, "assistant", answer)
 
     return ChatResponse(answer=answer)
 
 
 # --------------------------------------------------------------------------
 # POST /chat/stream — streaming version
-# Also writes to SQLite inside stream_and_save() after all tokens arrive
+# Also uses session_id to isolate memory and history per user
 # --------------------------------------------------------------------------
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
-    ## Same explanation as chat
-    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+    # Get or create memory for this specific session
+    memory = get_memory(request.session_id)
+
+    ## Same explanation as chat — filter ChromaDB to only search THIS user's documents
+    retriever = vector_store.as_retriever(
+        search_kwargs={"k": 3, "filter": {"session_id": request.session_id}}
+    )
     relevant_docs = retriever.invoke(request.question)
 
     ## Join the retrieved document chunks into one context string
@@ -750,8 +781,8 @@ async def chat_stream(request: ChatRequest):
 
         # Write to SQLite after streaming finishes so the exchange is persisted to disk
 
-        ## Same as chat function, we save the user + assistant answer to our db
-        db_save_message("user", request.question)
-        db_save_message("assistant", full_answer)
+        ## Same as chat function, we save the user + assistant answer to our db tagged with session_id
+        db_save_message(request.session_id, "user", request.question)
+        db_save_message(request.session_id, "assistant", full_answer)
 
     return StreamingResponse(stream_and_save(), media_type="text/plain")

@@ -1,10 +1,11 @@
 """
 Document & Image Summarizer — Streamlit UI
-Step 8: SQLite chat history.
+Multi-user update: each browser session gets its own isolated history and memory.
 
 What changed:
-  - On startup, calls GET /history to restore past chat from SQLite
-  - "Clear all" button now also calls DELETE /history to wipe SQLite
+  - uuid4 session_id generated on first load and stored in session_state
+  - session_id passed in every API call so history and memory are isolated per user
+  - GET /history, DELETE /history, /chat/stream, /store all pass session_id
   - Everything else unchanged
 
 Run order:
@@ -12,6 +13,8 @@ Run order:
   Terminal 2: streamlit run Home.py
 """
 
+import os
+import uuid
 import requests
 import streamlit as st
 
@@ -29,10 +32,6 @@ st.set_page_config(
 # Supported type of document person can upload
 SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg"]
 
-# The address FastAPI is running on.
-# All requests from Streamlit go to this base URL.
-# Defined once here so if the port ever changes, we only update it in one place.
-import os
 # In Docker, API_URL is set to "http://api:8000" via environment variable in docker-compose.yml
 # Locally it falls back to localhost:8000 so nothing breaks when running without Docker
 API_URL = os.getenv("API_URL", "http://localhost:8000")
@@ -48,17 +47,24 @@ API_URL = os.getenv("API_URL", "http://localhost:8000")
 if "summaries" not in st.session_state:
     st.session_state.summaries = {}        # filename -> summary text
 
-if "chat_history" not in st.session_state:
-    # NEW: restore chat history from SQLite on first load
-    # This runs once per browser session — if chat_history isn't in session_state
-    # yet, it means the page just loaded, so we fetch past messages from the API
-    # and pre-populate the list so the user sees their previous conversation immediately
+# Generate a unique session ID for this browser session on first load
+# uuid4() creates a random ID like "a3f8c2d1-..." that identifies this user
+# Stored in session_state so it persists across Streamlit reruns within the same tab
+# A new tab or new browser gets a new session_id, keeping histories separate
 
-    ## Page just loaded, lets try to retrieve all the old history from our db 
+## Each browser tab gets its own unique ID so history and memory are isolated per user
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+if "chat_history" not in st.session_state:
+    # Restore chat history from SQLite on first load for THIS session only
+    # passes session_id as a query param so the API returns only this user's messages
+
+    ## Page just loaded, lets try to retrieve all the old history from our db for THIS user
     try:
 
-        ## Call to history to retrieve all the old conversation from db
-        response = requests.get(f"{API_URL}/history")
+        ## Call to history to retrieve all the old conversation from db, filtered by session_id
+        response = requests.get(f"{API_URL}/history", params={"session_id": st.session_state.session_id})
         st.session_state.chat_history = response.json().get("messages", [])
     except Exception:
         # If the API isn't running yet, start with an empty history
@@ -90,17 +96,16 @@ def extract_text(uploaded_file) -> str:
 
 
 def store_text(filename: str, text: str):
-    # NEW in Step 5: send the extracted text to /store so ChromaDB
-    # chunks it, embeds it, and stores it for later retrieval during chat.
-    # StoreRequest format: {"filename": ___, "text": ___}
+    # Send the extracted text to /store so ChromaDB chunks it, embeds it, and stores it
+    # Now passes session_id so chunks are tagged to this user only
 
     ## Sends it over to the API side, our backend, of the filename and the content that we extracted from the file
     ## So that we can use it for future reference etc or when we ask questions about the file,
     ## since the db stores the text split into many smaller chunks from the file
-    ## API side of domain /store only accepts in the dictionary of {"filename": _____, "text": _____}
+    ## API side of domain /store only accepts in the dictionary of {"filename": _____, "text": _____, "session_id": _____}
     response = requests.post(
         f"{API_URL}/store",
-        json={"filename": filename, "text": text},
+        json={"filename": filename, "text": text, "session_id": st.session_state.session_id},
     )
     ## API side would then return the response and then we get the amount of chunks stored from the extracted text
     ## We then return it to let the user know for now how many chunks are stored
@@ -108,10 +113,8 @@ def store_text(filename: str, text: str):
 
 
 def summarize_text(text: str, length: str):
-    # NEW: calls /summarize/stream instead of /summarize
-    # Returns a generator that yields tokens one by one — same pattern as answer_question()
-    # st.write_stream() in the UI will display each token as it arrives,
-    # so the numbered breakdown appears section by section instead of all at once
+    # Calls /summarize/stream — no session_id needed here since summaries
+    # are stateless (just text in, summary out, nothing stored per user)
 
     ## Same as answer_question(), stream=True keeps the connection open
     ## and reads tokens as they arrive instead of waiting for the full response
@@ -127,15 +130,14 @@ def summarize_text(text: str, length: str):
 
 ## we can chat normally with the bot
 def answer_question(question: str):
-    # Calls /chat/stream — returns a generator that yields tokens one by one
-    # st.write_stream() displays each token as it arrives word by word
+    # Calls /chat/stream — passes session_id so the API uses this user's memory and history
 
     ## Same as above, we send a request to the API_URL but this time to the domain of chat
     ## stream=True keeps the connection open and reads tokens as they arrive
     ## instead of waiting for the whole response before returning
     with requests.post(
         f"{API_URL}/chat/stream",
-        json={"question": question},
+        json={"question": question, "session_id": st.session_state.session_id},
         stream=True,
     ) as response:
         for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
@@ -162,11 +164,10 @@ with st.sidebar:
     if st.button("🗑️ Clear all", use_container_width=True):
         st.session_state.summaries = {}
         st.session_state.chat_history = []
-        # NEW: also wipe SQLite and in-session memory on the API side
-        # Without this, clearing the UI would have no effect on the database —
-        # the history would come back the next time the page loads
+        # Wipe SQLite and in-session memory on the API side for THIS user only
+        # passes session_id so other users' history is not affected
         try:
-            requests.delete(f"{API_URL}/history")
+            requests.delete(f"{API_URL}/history", params={"session_id": st.session_state.session_id})
         except Exception:
             pass
         st.rerun()

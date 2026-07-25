@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y \
 # Copy requirements first — Docker caches each layer separately
 # If requirements.txt hasn't changed, this layer is reused and pip
 # install is skipped on rebuild, making rebuilds much faster
-COPY requirement.txt .
+COPY requirements.txt .
 
 # Install PyTorch nightly with cu128 first — needed for RTX 5070 sm_120 support
 # Installed before everything else so it doesn't get overwritten by requirements.txt
