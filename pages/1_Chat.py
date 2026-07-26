@@ -34,7 +34,7 @@ SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg"]
 
 # In Docker, API_URL is set to "http://api:8000" via environment variable in docker-compose.yml
 # Locally it falls back to localhost:8000 so nothing breaks when running without Docker
-API_URL = os.getenv("API_URL", "http://localhost:8000")
+API_URL = os.getenv("API_URL", "https://justinleowchongshing--tldr-bot-fastapi-app.modal.run")
 
 # --------------------------------------------------------------------------
 # Session state — Streamlit reruns the whole script on every click, so
@@ -74,24 +74,30 @@ if "chat_history" not in st.session_state:
 # Functions that talk to FastAPI
 # --------------------------------------------------------------------------
 
-def extract_text(uploaded_file) -> str:
-    # Send the file to FastAPI's /extract endpoint as a POST request.
-    # "files" is how you send a file in a POST request — FastAPI receives
-    # it as an UploadFile on the other end.
-    # The tuple is: (filename, raw bytes, content type)
 
-    ## Send over to our API side with the requests posting to our API_URL
-    ## "application/octet-stream" is a content type, a label of what we are sending, the file
-    ## "application/octet-stream"   → raw binary data (bytes), unknown format
-    ## because we have many different type of file format, so we do not specify
+#def extract_text(uploaded_file) -> str:
+#   ## Send over to our API side with the requests posting to our API_URL
+#   ## "application/octet-stream" is a content type, a label of what we are sending, the file
+#   ## "application/octet-stream"   → raw binary data (bytes), unknown format
+#   ## because we have many different type of file format, so we do not specify
+#   response = requests.post(
+#       f"{API_URL}/extract",
+#       files={"file": (uploaded_file.name, uploaded_file.read(), "application/octet-stream")},
+#       headers={"X-Requested-With": "XMLHttpRequest"},
+#   )
+#   ## we return the extracted text back to Streamlit, which saves it to session_state and displays it
+#   return response.json()["text"]
+
+
+
+def extract_text(uploaded_file) -> str:
     response = requests.post(
         f"{API_URL}/extract",
         files={"file": (uploaded_file.name, uploaded_file.read(), "application/octet-stream")},
+        headers={"X-Requested-With": "XMLHttpRequest"},
     )
-    # .json() parses the response FastAPI sends back into a Python dict
-    # FastAPI returned {"text": "..."} so ["text"] grabs just the extracted text string
-
-    ## we return the extracted text back to Streamlit, which saves it to session_state and displays it
+    print("Status:", response.status_code)
+    print("Response:", response.text[:500])
     return response.json()["text"]
 
 

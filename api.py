@@ -1,6 +1,7 @@
 """
 Document & Image Summarizer — FastAPI Backend
 Multi-user update: each browser session gets its own isolated history and memory.
+Long document update: map-reduce chunked summarization for documents over 30k tokens.
 
 What changed:
   - messages table now has session_id column to isolate per-user history
@@ -10,8 +11,14 @@ What changed:
   - ChatRequest and StoreRequest now include session_id
   - GET /history, DELETE /history, /chat, /chat/stream all accept session_id
   - /store tags ChromaDB chunks with session_id so document context is isolated per user
+  - summarize_long_document() added — splits long docs into chunks, summarizes each, combines
+  - /summarize/stream auto-detects document length and routes to normal or map-reduce path
+
+  - To run docker, just do docker-compose up --build
 
 Run with: uvicorn api:app --reload
+
+To Run on Docker: docker-compose up --build
 """
 
 import io
@@ -97,6 +104,11 @@ MAX_SUMMARY_TOKENS = 3000
 ## The model can only read up to about 30k tokens, hence if the document is more, we have to ensure that it falls within the token limit or else it will crash
 ## Variable is set so that we know the limit and ensure that it does not go above it
 MAX_INPUT_TOKENS = 30000
+
+# Chunk size for map-reduce long document summarization
+# 10,000 tokens is roughly 20-25 pages — small enough for the model to handle well
+# but large enough that we don't split into too many chunks for a 100 page doc
+LONG_DOC_CHUNK_TOKENS = 10000
 
 # Path to the SQLite database file — created automatically on first run
 # Sits next to api.py so it's easy to find and back up
@@ -305,11 +317,12 @@ tokenizer.pad_token = tokenizer.eos_token
 
 # Load base model with 4-bit quantization
 # device_map="auto" lets PyTorch figure out the best device — matches your eval script
+# NEW
 base_model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
     quantization_config=bnb_config,
     ## Let PyTorch decide whether to use GPU or CPU on its own
-    device_map="auto",
+    device_map="cpu",
     torch_dtype=torch.bfloat16,
     token=HF_TOKEN,
 )
@@ -423,7 +436,7 @@ class StoreResponse(BaseModel):
     chunks_stored: int
 
 # --------------------------------------------------------------------------
-# Long input handling — unchanged
+# Long input handling
 # --------------------------------------------------------------------------
 
 ## This is for convo with the LLM to ask question about the file
@@ -451,8 +464,63 @@ def truncate_text(text: str, max_tokens: int = MAX_INPUT_TOKENS) -> str:
     return truncated_text
 
 # --------------------------------------------------------------------------
-# generate() — non-streaming, used by /summarize
-# Unchanged — LangChain doesn't help with streaming summarization
+# Map-reduce summarization for long documents
+# Called automatically when a document exceeds MAX_INPUT_TOKENS
+#
+# How it works:
+#   Step 1 — Split the full token list into chunks of LONG_DOC_CHUNK_TOKENS each
+#             A 100 page PDF (~70k tokens) becomes ~7 chunks of 10k tokens each
+#   Step 2 — Summarize each chunk individually with a short bullet-point prompt
+#             Each chunk gets its own model call → 7 mini-summaries
+#   Step 3 — Combine all mini-summaries into one text block
+#             Feed that block into the normal summary prompt to get the final output
+#
+# Why not just truncate?
+#   Truncating cuts off everything after page ~40 of a 100 page doc
+#   Map-reduce sees ALL pages and produces a summary that covers the whole document
+# --------------------------------------------------------------------------
+def summarize_long_document(text: str, length: str) -> str:
+    # Step 1 — tokenize the full text and split into fixed-size token chunks
+    # We work with token IDs directly so chunk boundaries are exact
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    chunks = [
+        tokenizer.decode(token_ids[i:i + LONG_DOC_CHUNK_TOKENS], skip_special_tokens=True)
+        for i in range(0, len(token_ids), LONG_DOC_CHUNK_TOKENS)
+    ]
+    print(f"[long doc] {len(token_ids)} tokens split into {len(chunks)} chunks of {LONG_DOC_CHUNK_TOKENS}")
+
+    # Step 2 — summarize each chunk with a short focused prompt
+    # We use a simpler prompt here than the full SUMMARY_PROMPTS because:
+    # (a) each chunk is only a section, not the whole document
+    # (b) we want bullet points that are easy to combine in step 3
+    chunk_summaries = []
+    for i, chunk in enumerate(chunks):
+        print(f"[long doc] Summarizing chunk {i + 1}/{len(chunks)}")
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                f"Summarize the key points from this section of a document in 3-5 bullet points. "
+                f"Be concise — each bullet should be one clear sentence.\n\nSection {i + 1}:\n{chunk}"
+            )},
+        ]
+        # 500 tokens per chunk summary is enough for 3-5 bullet points
+        chunk_summary = generate(messages, max_new_tokens=500)
+        chunk_summaries.append(f"Section {i + 1}:\n{chunk_summary}")
+
+    # Step 3 — combine all chunk summaries and run through the normal summary prompt
+    # combined is now a text of bullet-point section summaries covering the full document
+    # We feed this into the user's chosen prompt (Short/Medium/Detailed) for the final output
+    combined = "\n\n".join(chunk_summaries)
+    prompt_template = SUMMARY_PROMPTS.get(length, SUMMARY_PROMPTS["Medium"])
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt_template.format(text=combined)},
+    ]
+    return generate(messages, max_new_tokens=MAX_SUMMARY_TOKENS)
+
+# --------------------------------------------------------------------------
+# generate() — non-streaming, used by /summarize and summarize_long_document
 # --------------------------------------------------------------------------
 def generate(messages: list, max_new_tokens: int = MAX_CHAT_TOKENS) -> str:
     # apply_chat_template formats the message list into the exact prompt string
@@ -483,8 +551,7 @@ def generate(messages: list, max_new_tokens: int = MAX_CHAT_TOKENS) -> str:
     return full[len(prompt_text):].strip()
 
 # --------------------------------------------------------------------------
-# generate_stream() — streaming, used by /summarize/stream
-# Unchanged — LangChain doesn't help with streaming summarization
+# generate_stream() — streaming, used by /summarize/stream for short docs
 # --------------------------------------------------------------------------
 def generate_stream(messages: list, max_new_tokens: int = MAX_CHAT_TOKENS):
     prompt = tokenizer.apply_chat_template(
@@ -602,7 +669,7 @@ async def extract(file: UploadFile = File(...)):
 
 
 # --------------------------------------------------------------------------
-# POST /store — now tags chunks with session_id so each user's documents
+# POST /store — tags chunks with session_id so each user's documents
 # are isolated in ChromaDB and don't bleed into other users' searches
 # --------------------------------------------------------------------------
 @app.post("/store", response_model=StoreResponse)
@@ -641,8 +708,6 @@ async def store(request: StoreRequest):
 @app.post("/summarize", response_model=SummarizeResponse)
 async def summarize(request: SummarizeRequest):
     prompt_template = SUMMARY_PROMPTS.get(request.length, SUMMARY_PROMPTS["Medium"])
-
-    # truncate the document text if it's too long for the model's context window
     safe_text = truncate_text(request.text)
 
     messages = [
@@ -655,29 +720,61 @@ async def summarize(request: SummarizeRequest):
 
 
 # --------------------------------------------------------------------------
-# POST /summarize/stream — unchanged
+# POST /summarize/stream
+# Auto-detects document length and routes to the correct path:
+#
+# Short doc (under 30k tokens) → normal streaming path, unchanged
+#   User sees tokens appear word by word as they generate
+#
+# Long doc (over 30k tokens) → map-reduce path
+#   User sees a status message, then the final combined summary
+#   Non-streaming because we need all chunk summaries before producing the final output
 # --------------------------------------------------------------------------
 @app.post("/summarize/stream")
 async def summarize_stream(request: SummarizeRequest):
-    prompt_template = SUMMARY_PROMPTS.get(request.length, SUMMARY_PROMPTS["Medium"])
+    # Count tokens in the document to decide which path to take
+    token_count = len(tokenizer.encode(request.text, add_special_tokens=False))
 
-    # truncate the document text if it's too long for the model's context window
-    safe_text = truncate_text(request.text)
+    if token_count <= MAX_INPUT_TOKENS:
+        # Normal path — document fits in context window, stream tokens directly
+        prompt_template = SUMMARY_PROMPTS.get(request.length, SUMMARY_PROMPTS["Medium"])
+        safe_text = truncate_text(request.text)
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": prompt_template.format(text=safe_text)},
-    ]
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt_template.format(text=safe_text)},
+        ]
 
-    return StreamingResponse(
-        generate_stream(messages, max_new_tokens=MAX_SUMMARY_TOKENS),
-        media_type="text/plain",
-    )
+        return StreamingResponse(
+            generate_stream(messages, max_new_tokens=MAX_SUMMARY_TOKENS),
+            media_type="text/plain",
+        )
+
+    else:
+        # Long document path — too big for context window, use map-reduce
+        # We wrap summarize_long_document() in a generator so StreamingResponse still works
+        # The user sees a status message immediately so they know processing has started
+        # then the full summary appears when all chunks are done
+        num_chunks = (token_count + LONG_DOC_CHUNK_TOKENS - 1) // LONG_DOC_CHUNK_TOKENS
+        print(f"[summarize/stream] Long doc detected: {token_count} tokens → {num_chunks} chunks")
+
+        def long_doc_stream():
+            # Yield a status message immediately so the user knows what's happening
+            # Without this the UI would appear frozen for several minutes
+            yield f"📄 Long document detected ({token_count:,} tokens, ~{num_chunks} sections).\n"
+            yield f"Summarizing each section then combining — this may take a few minutes...\n\n"
+
+            # Run map-reduce summarization — this is blocking but runs in the background
+            # since FastAPI handles it in an async context
+            summary = summarize_long_document(request.text, request.length)
+            yield summary
+
+        return StreamingResponse(long_doc_stream(), media_type="text/plain")
 
 
 # --------------------------------------------------------------------------
 # POST /chat — non-streaming fallback
-# Now uses session_id to isolate memory and history per user
+# Uses session_id to isolate memory and history per user
 # --------------------------------------------------------------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
@@ -734,7 +831,7 @@ async def chat(request: ChatRequest):
 
 # --------------------------------------------------------------------------
 # POST /chat/stream — streaming version
-# Also uses session_id to isolate memory and history per user
+# Uses session_id to isolate memory and history per user
 # --------------------------------------------------------------------------
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
