@@ -1,13 +1,19 @@
 """
 TLDR BOT — Landing Page (Home.py)
 Dark background matching the chat page.
+Password gate before anything else loads.
 Button sits directly under the tagline — no scroll needed.
 Demo screenshot embedded below the hero as a preview card.
 """
 
-import streamlit as st
-from pathlib import Path
+import os
 import base64
+from pathlib import Path
+import streamlit as st
+
+# --------------------------------------------------------------------------
+# Page setup — must be first Streamlit call
+# --------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="TLDR BOT",
@@ -15,13 +21,48 @@ st.set_page_config(
     layout="centered",
 )
 
+# --------------------------------------------------------------------------
+# Password gate — runs before any CSS or HTML renders
+# If not authenticated, show ONLY the login form and stop
+# Nothing else — no CSS, no hero, no button — loads until correct password
+# APP_PASSWORD is set in Streamlit Cloud secrets, not hardcoded here
+# --------------------------------------------------------------------------
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🔒 TLDR BOT")
+    st.write("Enter password to continue.")
+    password = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if password == os.getenv("APP_PASSWORD", "changeme"):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Wrong password")
+    st.stop()
+
+# --------------------------------------------------------------------------
+# Everything below only runs after correct password is entered
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Custom CSS
+# Full-viewport hero — title is centered vertically and horizontally.
+# No scrolling needed: everything fits in one screen.
+# --------------------------------------------------------------------------
+
 st.markdown("""
 <style>
+    /* Hide Streamlit chrome we don't want on a landing page */
     #MainMenu { visibility: hidden; }
     footer { visibility: hidden; }
     header { visibility: hidden; }
     [data-testid="stSidebar"] { display: none; }
     [data-testid="collapsedControl"] { display: none; }
+    /* Hide sidebar navigation so users cant skip to chat without logging in */
+    [data-testid="stSidebarNav"] { display: none; }
 
     .stApp { background: #0a0a0a; }
 
@@ -31,7 +72,7 @@ st.markdown("""
         margin: 0 auto !important;
     }
 
-    /* Hero — just enough height to center the text block, no excess */
+    /* Hero wrapper — vertically centered, full height */
     .hero {
         min-height: 0;
         display: flex;
@@ -82,7 +123,7 @@ st.markdown("""
         background: #111;
     }
 
-    /* Button — white pill on dark bg, sits right under the hero content */
+    /* Button — white pill on dark bg */
     [data-testid="stButton"] {
         display: flex;
         justify-content: center;
@@ -129,10 +170,6 @@ st.markdown("""
         width: 100%;
         display: block;
     }
-
-    css
-    /* Hide sidebar navigation on landing page before login */
-    [data-testid="stSidebarNav"] { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -158,7 +195,6 @@ st.markdown("""
 
 # --------------------------------------------------------------------------
 # CTA button — real Streamlit widget, centered via CSS above
-# Sits directly under the hero HTML block with no gap
 # --------------------------------------------------------------------------
 col1, col2, col3 = st.columns([1, 2, 1])
 with col2:
@@ -167,13 +203,8 @@ with col2:
 
 # --------------------------------------------------------------------------
 # Demo preview — your chat screenshot embedded as an image
-# Replace the path below with your actual screenshot file once you have one.
-# For now it shows a placeholder message if the file isn't found.
+# Save your screenshot as demo.png next to Home.py to show it here
 # --------------------------------------------------------------------------
-
-# To add your screenshot:
-# 1. Save your chat screenshot as demo.png in the same folder as Home.py
-# 2. The card below will automatically display it
 
 demo_path = Path("demo.png")
 
@@ -181,7 +212,6 @@ st.markdown('<div class="preview-wrap">', unsafe_allow_html=True)
 st.markdown('<p class="preview-label">See it in action</p>', unsafe_allow_html=True)
 
 if demo_path.exists():
-    # Read and base64-encode the image so it embeds directly in HTML
     img_b64 = base64.b64encode(demo_path.read_bytes()).decode()
     st.markdown(f"""
     <div class="preview-card">
@@ -189,7 +219,6 @@ if demo_path.exists():
     </div>
     """, unsafe_allow_html=True)
 else:
-    # Placeholder shown until you drop in demo.png
     st.markdown("""
     <div class="preview-card" style="background:#111; padding: 4rem 2rem; text-align:center;">
         <p style="color:#444; font-size:0.9rem;">
