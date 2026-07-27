@@ -16,12 +16,19 @@ Local dev still uses: uvicorn api:app --reload
 Modal is production only
 """
 
-
 import os
 import streamlit as st
+from pathlib import Path
+import base64
 
-# Password gate — blocks access before anything else loads
-# APP_PASSWORD is stored in Streamlit Cloud secrets, not hardcoded
+# 1. set_page_config MUST be first
+st.set_page_config(
+    page_title="TLDR BOT",
+    page_icon="⚡",
+    layout="centered",
+)
+
+# 2. Password gate comes after
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
@@ -36,7 +43,8 @@ if not st.session_state.authenticated:
             st.error("Wrong password")
     st.stop()
 
-# Everything below only runs after correct password is entered
+# 3. Rest of your Home.py CSS and hero content continues here
+st.markdown("""...""")
 
 import io
 import gc
