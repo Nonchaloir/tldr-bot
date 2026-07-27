@@ -2,49 +2,15 @@
 TLDR BOT — Modal Deployment
 Runs the FastAPI backend on Modal's cloud GPU infrastructure.
 
-How it works:
-  - Modal builds a container image with all dependencies
-  - The container runs on an A10G GPU (24GB VRAM) on demand
-  - Scales to zero when idle — you only pay when someone uses the app
-  - Cold start (first request after idle): ~60-90 seconds to load model
-  - Subsequent requests in same session: fast
+What changed from previous version:
+  - repetition_penalty=1.5 added to prevent generation loops
+  - no_repeat_ngram_size=3 added to stop token repetition
+  - scaledown_window reduced to 30 seconds to save costs
+  - summarize_long_document() truncates combined summaries to 15000 tokens
+    so the final combine step never overflows the context window
 
 Deploy with: modal deploy modal_app.py
-Get endpoint URL from Modal dashboard after deploying
-
-Local dev still uses: uvicorn api:app --reload
-Modal is production only
 """
-
-import os
-import streamlit as st
-from pathlib import Path
-import base64
-
-# 1. set_page_config MUST be first
-st.set_page_config(
-    page_title="TLDR BOT",
-    page_icon="⚡",
-    layout="centered",
-)
-
-# 2. Password gate comes after
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    st.title("🔒 TLDR BOT")
-    password = st.text_input("Enter password", type="password")
-    if st.button("Login"):
-        if password == os.getenv("APP_PASSWORD", "changeme"):
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("Wrong password")
-    st.stop()
-
-# 3. Rest of your Home.py CSS and hero content continues here
-st.markdown("""...""")
 
 import io
 import gc
@@ -55,29 +21,23 @@ from threading import Thread
 import modal
 
 # --------------------------------------------------------------------------
-# Modal image — defines what gets installed in the container
-# Start from a CUDA-enabled base so PyTorch can use the A10G GPU
+# Modal image
 # --------------------------------------------------------------------------
 
-# Define the container image
-# modal.Image.from_registry pulls a pre-built Docker image as the base
-# We use nvidia/cuda so CUDA libraries are already present for PyTorch
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04",
         add_python="3.11",
     )
-    # Install PyTorch nightly with cu128 support for CUDA 12.8
-    # This is the same fix used locally for sm_120 compatibility
     .pip_install(
         "torch", "torchvision", "torchaudio",
         extra_index_url="https://download.pytorch.org/whl/nightly/cu128",
         pre=True,
     )
-    # Install all other dependencies
     .pip_install(
         "fastapi",
         "uvicorn",
+        "python-multipart",
         "pdfplumber",
         "easyocr",
         "pillow",
@@ -97,8 +57,7 @@ image = (
         "langchain-huggingface",
         "langchain-text-splitters",
         "pydantic",
-        "python-multipart",    # ← add this line
-
+        "starlette",
     )
 )
 
@@ -106,86 +65,69 @@ image = (
 # Modal app definition
 # --------------------------------------------------------------------------
 
-# Create the Modal app — this is the entry point Modal uses
-# All functions decorated with @app.function() run on Modal's infrastructure
 app = modal.App("tldr-bot", image=image)
 
-# Persistent volumes — these survive container restarts
-# Same as Docker volume mounts but managed by Modal
-# chroma_db stores document chunks between requests
-# chat_history stores SQLite messages between requests
+# Persistent volumes — survive container restarts
 chroma_volume = modal.Volume.from_name("tldr-bot-chroma", create_if_missing=True)
-db_volume = modal.Volume.from_name("tldr-bot-db", create_if_missing=True)
+db_volume     = modal.Volume.from_name("tldr-bot-db",     create_if_missing=True)
 
-# Modal secrets — stores your HuggingFace token securely
-# Create this in Modal dashboard: modal.com → Secrets → New Secret
-# Name it "huggingface" with key HF_TOKEN = your token
-# Never hardcode tokens in code
+# HuggingFace token — set in Modal dashboard → Secrets → "huggingface"
 hf_secret = modal.Secret.from_name("huggingface")
 
 # --------------------------------------------------------------------------
-# The FastAPI app — same logic as api.py but decorated for Modal
-# @app.function tells Modal to run this on their infrastructure
-# gpu="A10G" requests an NVIDIA A10G (24GB VRAM) — enough for 7B easily
-# volumes mounts our persistent storage into the container
-# secrets injects HF_TOKEN as an environment variable
-# timeout=600 allows up to 10 minutes for long document summarization
-# container_idle_timeout=300 keeps container warm for 5 minutes after last request
-#   so back-to-back requests don't each pay cold start cost
+# FastAPI app running on Modal A10G GPU
+# scaledown_window=30 — container shuts down after 30s idle to save credits
+# timeout=600 — allow up to 10 minutes for long document summarization
 # --------------------------------------------------------------------------
 @app.function(
     gpu="A10G",
     volumes={
-        "/chroma_db": chroma_volume,
+        "/chroma_db":    chroma_volume,
         "/chat_history": db_volume,
     },
     secrets=[hf_secret],
     timeout=600,
-    scaledown_window=300,
+    scaledown_window=30,
 )
-
-
 @modal.asgi_app()
 def fastapi_app():
-    # All imports inside the function so they run inside the Modal container
     import torch
     from fastapi import FastAPI, File, UploadFile, HTTPException
     from fastapi.responses import StreamingResponse
     from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
-    from dotenv import load_dotenv
     from huggingface_hub import login
     from peft import PeftModel
     from PIL import Image
     from transformers import (
         AutoModelForCausalLM, AutoTokenizer,
-        BitsAndBytesConfig, TextIteratorStreamer
+        BitsAndBytesConfig, TextIteratorStreamer,
     )
     from langchain_text_splitters import RecursiveCharacterTextSplitter
-    from langchain_core.documents import Document
     from langchain_chroma import Chroma
     from langchain_huggingface import HuggingFaceEmbeddings
     from langchain_core.chat_history import InMemoryChatMessageHistory
     from langchain_core.messages import HumanMessage, AIMessage
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
     import easyocr
     import numpy as np
     import pdfplumber
-    import sqlite3
 
     # --------------------------------------------------------------------------
-    # Config — same values as api.py
+    # Config
     # --------------------------------------------------------------------------
 
     HF_TOKEN     = os.environ["HF_TOKEN"]
     BASE_MODEL   = "Qwen/Qwen2.5-7B-Instruct"
-    ADAPTER_REPO = "DraSlayer/personal-v2-llm-phase8-7b"
+    ADAPTER_REPO = "DraSlayer/personal-v2-llm-phase9-7b"
 
     MAX_CHAT_TOKENS       = 350
     MAX_SUMMARY_TOKENS    = 3000
     MAX_INPUT_TOKENS      = 30000
     LONG_DOC_CHUNK_TOKENS = 10000
 
-    # Paths inside the Modal container — these map to our persistent volumes
+    # Paths inside the Modal container mapped to persistent volumes
     DB_PATH     = "/chat_history/chat_history.db"
     CHROMA_PATH = "/chroma_db"
 
@@ -194,9 +136,8 @@ def fastapi_app():
     # --------------------------------------------------------------------------
 
     web_app = FastAPI(title="TLDR BOT API")
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request
 
+    # Bypass Modal CSRF protection for multipart file uploads
     class DisableCSRF(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
             request.headers.__dict__["_list"] = [
@@ -206,9 +147,6 @@ def fastapi_app():
             return await call_next(request)
 
     web_app.add_middleware(DisableCSRF)
-
-    from starlette.middleware.trustedhost import TrustedHostMiddleware
-
     web_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -236,13 +174,23 @@ Then end with:
 
 Document:
 {text}""",
-"Medium": """Read this document and list all the important concepts.
 
-For each concept write:
-1. What it is (2-3 sentences)
-2. Example: [a concrete example]
+"Medium": """Read this document and identify ALL the important concepts.
 
-Do not skip the Example section for any concept.
+First, list every important concept as a numbered list:
+1. [Concept Name]
+2. [Concept Name]
+3. [Concept Name]
+...and so on for every concept in the document.
+
+Then, for each concept in the list, write a full detailed explanation using this format:
+
+**[Number]. [Concept Name]**
+- What it is: Explain clearly in 3-4 sentences what this concept means and how it works.
+- Why it matters: One sentence on why this is important.
+- Example: A concrete specific example from the document or a worked example showing the concept in action.
+
+Do this for every single concept in the numbered list above. Do not skip any.
 
 Document:
 {text}""",
@@ -259,7 +207,7 @@ Identify all major concepts or topics covered. For each one, write:
 After covering all concepts, end with:
 
 **TL;DR**
-Write 4-6 sentences summarising the entire document in plain, simple language — as if explaining to a friend who knows nothing about the topic.
+Write 4-6 sentences summarising the entire document in plain, simple language.
 
 **Likely Exam Topics**
 Based on this document, list 3-5 specific things that are most likely to be tested.
@@ -269,7 +217,7 @@ Document:
     }
 
     # --------------------------------------------------------------------------
-    # SQLite setup — same functions as api.py
+    # SQLite setup
     # --------------------------------------------------------------------------
 
     def init_db():
@@ -319,7 +267,6 @@ Document:
     )
 
     login(token=HF_TOKEN)
-
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -404,7 +351,7 @@ Document:
         chunks_stored: int
 
     # --------------------------------------------------------------------------
-    # Helper functions — same as api.py
+    # Helper functions
     # --------------------------------------------------------------------------
 
     def truncate_text(text: str, max_tokens: int = MAX_INPUT_TOKENS) -> str:
@@ -412,9 +359,8 @@ Document:
         if len(token_ids) <= max_tokens:
             return text
         truncated_ids = token_ids[:max_tokens]
-        truncated_text = tokenizer.decode(truncated_ids, skip_special_tokens=True)
         print(f"[truncate_text] Input was {len(token_ids)} tokens — truncated to {max_tokens}")
-        return truncated_text
+        return tokenizer.decode(truncated_ids, skip_special_tokens=True)
 
     def generate(messages: list, max_new_tokens: int = MAX_CHAT_TOKENS) -> str:
         prompt = tokenizer.apply_chat_template(
@@ -428,7 +374,8 @@ Document:
                 do_sample=False,
                 temperature=1.0,
                 pad_token_id=tokenizer.eos_token_id,
-                repetition_penalty=1.3,  # ← add this
+                repetition_penalty=1.5,
+                no_repeat_ngram_size=3,
             )
         full = tokenizer.decode(output[0], skip_special_tokens=True)
         prompt_text = tokenizer.decode(inputs["input_ids"][0], skip_special_tokens=True)
@@ -449,8 +396,8 @@ Document:
             do_sample=False,
             temperature=1.0,
             pad_token_id=tokenizer.eos_token_id,
-            repetition_penalty=1.3,  # ← add this
-
+            repetition_penalty=1.5,
+            no_repeat_ngram_size=3,
         )
         thread = Thread(target=llm.generate, kwargs=generation_kwargs)
         thread.start()
@@ -465,28 +412,34 @@ Document:
             for i in range(0, len(token_ids), LONG_DOC_CHUNK_TOKENS)
         ]
         print(f"[long doc] {len(token_ids)} tokens split into {len(chunks)} chunks")
+
         chunk_summaries = []
         for i, chunk in enumerate(chunks):
             print(f"[long doc] Summarizing chunk {i + 1}/{len(chunks)}")
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": (
-                    f"Summarize the key points from this section of a document in 3-5 bullet points. "
+                    f"Summarize the key points from this section in 3-5 bullet points. "
                     f"Be concise — each bullet should be one clear sentence.\n\nSection {i + 1}:\n{chunk}"
                 )},
             ]
             chunk_summary = generate(messages, max_new_tokens=500)
             chunk_summaries.append(f"Section {i + 1}:\n{chunk_summary}")
+
+        # Truncate combined summaries to 15000 tokens so the final combine step
+        # never overflows the context window — this was causing the "Network Network" loop
         combined = "\n\n".join(chunk_summaries)
+        safe_combined = truncate_text(combined, max_tokens=15000)
+
         prompt_template = SUMMARY_PROMPTS.get(length, SUMMARY_PROMPTS["Medium"])
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt_template.format(text=combined)},
+            {"role": "user", "content": prompt_template.format(text=safe_combined)},
         ]
         return generate(messages, max_new_tokens=MAX_SUMMARY_TOKENS)
 
     # --------------------------------------------------------------------------
-    # Endpoints — same as api.py
+    # Endpoints
     # --------------------------------------------------------------------------
 
     @web_app.get("/health")
@@ -495,8 +448,7 @@ Document:
 
     @web_app.get("/history")
     async def get_history(session_id: str):
-        messages = db_load_messages(session_id)
-        return {"messages": messages}
+        return {"messages": db_load_messages(session_id)}
 
     @web_app.delete("/history")
     async def clear_history(session_id: str):
@@ -525,8 +477,7 @@ Document:
                 image = Image.open(io.BytesIO(contents))
                 image_np = np.array(image)
                 results = ocr_reader.readtext(image_np)
-                extracted = " ".join([block[1] for block in results])
-                return {"text": extracted}
+                return {"text": " ".join([block[1] for block in results])}
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Image OCR failed: {str(e)}")
         else:
@@ -534,7 +485,10 @@ Document:
 
     @web_app.post("/store", response_model=StoreResponse)
     async def store(request: StoreRequest):
-        existing = vector_store.get(where={"$and": [{"filename": request.filename}, {"session_id": request.session_id}]})
+        existing = vector_store.get(where={"$and": [
+            {"filename": request.filename},
+            {"session_id": request.session_id}
+        ]})
         if existing and existing.get("ids"):
             return StoreResponse(chunks_stored=0)
         docs = text_splitter.create_documents(
@@ -552,12 +506,12 @@ Document:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt_template.format(text=safe_text)},
         ]
-        summary = generate(messages, max_new_tokens=MAX_SUMMARY_TOKENS)
-        return SummarizeResponse(summary=summary)
+        return SummarizeResponse(summary=generate(messages, max_new_tokens=MAX_SUMMARY_TOKENS))
 
     @web_app.post("/summarize/stream")
     async def summarize_stream(request: SummarizeRequest):
         token_count = len(tokenizer.encode(request.text, add_special_tokens=False))
+
         if token_count <= MAX_INPUT_TOKENS:
             prompt_template = SUMMARY_PROMPTS.get(request.length, SUMMARY_PROMPTS["Medium"])
             safe_text = truncate_text(request.text)
@@ -571,12 +525,12 @@ Document:
             )
         else:
             num_chunks = (token_count + LONG_DOC_CHUNK_TOKENS - 1) // LONG_DOC_CHUNK_TOKENS
+            print(f"[summarize/stream] Long doc: {token_count} tokens → {num_chunks} chunks")
 
             def long_doc_stream():
                 yield f"📄 Long document detected ({token_count:,} tokens, ~{num_chunks} sections).\n"
                 yield f"Summarizing each section then combining — this may take a few minutes...\n\n"
-                summary = summarize_long_document(request.text, request.length)
-                yield summary
+                yield summarize_long_document(request.text, request.length)
 
             return StreamingResponse(long_doc_stream(), media_type="text/plain")
 
