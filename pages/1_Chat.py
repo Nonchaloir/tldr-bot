@@ -29,6 +29,13 @@ st.set_page_config(
     layout="wide",
 )
 
+
+# Password gate — same check as Home.py
+# Prevents direct URL access to /Chat without authenticating first
+if "authenticated" not in st.session_state or not st.session_state.authenticated:
+    st.error("Please log in from the home page first.")
+    st.stop()
+    
 # Supported type of document person can upload
 SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg"]
 

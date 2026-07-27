@@ -129,6 +129,10 @@ st.markdown("""
         width: 100%;
         display: block;
     }
+
+    css
+    /* Hide sidebar navigation on landing page before login */
+    [data-testid="stSidebarNav"] { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
