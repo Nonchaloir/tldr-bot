@@ -16,6 +16,28 @@ Local dev still uses: uvicorn api:app --reload
 Modal is production only
 """
 
+
+import os
+import streamlit as st
+
+# Password gate — blocks access before anything else loads
+# APP_PASSWORD is stored in Streamlit Cloud secrets, not hardcoded
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🔒 TLDR BOT")
+    password = st.text_input("Enter password", type="password")
+    if st.button("Login"):
+        if password == os.getenv("APP_PASSWORD", "changeme"):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Wrong password")
+    st.stop()
+
+# Everything below only runs after correct password is entered
+
 import io
 import gc
 import os
