@@ -1,13 +1,17 @@
 """
 TLDR BOT — Modal Deployment
-Runs the FastAPI backend on Modal's cloud GPU infrastructure.
+Final stable version.
 
 What changed from previous version:
-  - repetition_penalty=1.5 added to prevent generation loops
-  - no_repeat_ngram_size=3 added to stop token repetition
-  - scaledown_window reduced to 30 seconds to save costs
-  - summarize_long_document() truncates combined summaries to 15000 tokens
-    so the final combine step never overflows the context window
+  - StopOnRepetition stopping criteria added back — catches hard loops
+    (same token 15 times) without distorting normal output
+  - No repetition_penalty, no no_repeat_ngram_size — matches eval script
+  - eos_token_id explicitly set so model stops naturally when done
+  - stopping_criteria catches cases where eos token isn't generated cleanly
+  - clean_text() strips Cengage copyright and URLs from PDF
+  - No system prompt — matches eval script setup
+  - scaledown_window=300 — stays warm 5 minutes to reduce cold starts
+  - Debug prints kept for Modal logs investigation
 
 Deploy with: modal deploy modal_app.py
 """
@@ -21,7 +25,7 @@ from threading import Thread
 import modal
 
 # --------------------------------------------------------------------------
-# Modal image
+# Modal image — pinned package versions to match local environment
 # --------------------------------------------------------------------------
 
 image = (
@@ -43,10 +47,10 @@ image = (
         "pillow",
         "numpy",
         "python-dotenv",
-        "transformers",
-        "peft",
-        "accelerate",
-        "bitsandbytes",
+        "transformers==5.13.1",
+        "peft==0.19.1",
+        "accelerate==1.14.0",
+        "bitsandbytes==0.49.2",
         "huggingface_hub",
         "sentence-transformers",
         "chromadb",
@@ -67,18 +71,10 @@ image = (
 
 app = modal.App("tldr-bot", image=image)
 
-# Persistent volumes — survive container restarts
 chroma_volume = modal.Volume.from_name("tldr-bot-chroma", create_if_missing=True)
 db_volume     = modal.Volume.from_name("tldr-bot-db",     create_if_missing=True)
+hf_secret     = modal.Secret.from_name("huggingface")
 
-# HuggingFace token — set in Modal dashboard → Secrets → "huggingface"
-hf_secret = modal.Secret.from_name("huggingface")
-
-# --------------------------------------------------------------------------
-# FastAPI app running on Modal A10G GPU
-# scaledown_window=30 — container shuts down after 30s idle to save credits
-# timeout=600 — allow up to 10 minutes for long document summarization
-# --------------------------------------------------------------------------
 @app.function(
     gpu="A10G",
     volumes={
@@ -87,7 +83,7 @@ hf_secret = modal.Secret.from_name("huggingface")
     },
     secrets=[hf_secret],
     timeout=600,
-    scaledown_window=30,
+    scaledown_window=60,
 )
 @modal.asgi_app()
 def fastapi_app():
@@ -102,6 +98,7 @@ def fastapi_app():
     from transformers import (
         AutoModelForCausalLM, AutoTokenizer,
         BitsAndBytesConfig, TextIteratorStreamer,
+        StoppingCriteria, StoppingCriteriaList,
     )
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     from langchain_chroma import Chroma
@@ -113,21 +110,24 @@ def fastapi_app():
     import easyocr
     import numpy as np
     import pdfplumber
+    import re
 
     # --------------------------------------------------------------------------
     # Config
     # --------------------------------------------------------------------------
 
     HF_TOKEN     = os.environ["HF_TOKEN"]
-    BASE_MODEL   = "Qwen/Qwen2.5-7B-Instruct"
-    ADAPTER_REPO = "DraSlayer/personal-v2-llm-phase9-7b"
+    BASE_MODEL   = "Qwen/Qwen2.5-3B-Instruct"
+    ADAPTER_REPO = "DraSlayer/personal-llm-phase17-3b"
 
+    # Matched to eval script — 350 was used in phase 17 eval
+    # Model stops naturally via eos_token_id before hitting this ceiling
+    # This is a safety net, not a target
     MAX_CHAT_TOKENS       = 350
-    MAX_SUMMARY_TOKENS    = 3000
+    MAX_SUMMARY_TOKENS    = 1500
     MAX_INPUT_TOKENS      = 30000
     LONG_DOC_CHUNK_TOKENS = 10000
 
-    # Paths inside the Modal container mapped to persistent volumes
     DB_PATH     = "/chat_history/chat_history.db"
     CHROMA_PATH = "/chroma_db"
 
@@ -137,7 +137,6 @@ def fastapi_app():
 
     web_app = FastAPI(title="TLDR BOT API")
 
-    # Bypass Modal CSRF protection for multipart file uploads
     class DisableCSRF(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
             request.headers.__dict__["_list"] = [
@@ -155,62 +154,53 @@ def fastapi_app():
         allow_credentials=True,
     )
 
-    SYSTEM_PROMPT = """You are a helpful document assistant. You answer questions based on the provided context.
-
-If asked about a specific book, film, TV show, person, statistic, survey, or event that you cannot verify exists in your knowledge, say clearly that you cannot find reliable information about it rather than generating a plausible-sounding description. Never fabricate plot details, biographies, statistics, or historical specifics you cannot verify.
-
-Always base your answers on the context provided to you."""
+    # No system prompt — model was trained and evaluated without one
+    # Adding a system prompt changes the input distribution and can cause
+    # the model to output training artifacts instead of natural responses
 
     SUMMARY_PROMPTS = {
-        "Short": """Analyse this document and produce a concise breakdown:
+        "Short": """Analyse this document and produce a concise breakdown.
 
-For each of the 2-3 most important concepts in the document, write:
+For each of the 2-3 most important concepts write:
 **[Concept Name]**
-→ What it is: one clear sentence definition
+→ What it is: one clear sentence
 → Why it matters: one sentence
 
-Then end with:
-**TL;DR:** One paragraph summarising the whole document in simple language.
+End with:
+**TL;DR:** One paragraph summary in simple language.
 
 Document:
 {text}""",
 
-"Medium": """Read this document and identify ALL the important concepts.
+"Medium": """The following is a university lecture document. Extract and explain all the key concepts from it.
 
-First, list every important concept as a numbered list:
-1. [Concept Name]
-2. [Concept Name]
-3. [Concept Name]
-...and so on for every concept in the document.
+Do not ask questions. Do not say you can help. Just directly output the concepts.
 
-Then, for each concept in the list, write a full detailed explanation using this format:
+For each concept use this format:
+**[Concept Name]**
+What it is: [2 sentences]
+Example: [one example]
 
-**[Number]. [Concept Name]**
-- What it is: Explain clearly in 3-4 sentences what this concept means and how it works.
-- Why it matters: One sentence on why this is important.
-- Example: A concrete specific example from the document or a worked example showing the concept in action.
-
-Do this for every single concept in the numbered list above. Do not skip any.
+---
 
 Document:
 {text}""",
+        "Detailed": """Analyse this document and produce an in-depth study breakdown.
 
-        "Detailed": """Analyse this document thoroughly and produce an in-depth study breakdown:
-
-Identify all major concepts or topics covered. For each one, write:
+For each major concept write:
 
 **[Number]. [Concept Name]**
-→ **What it is:** A thorough explanation in 3-5 sentences covering what it means and how it works.
-→ **Key details:** Any important conditions, formulas, rules, or nuances mentioned in the document.
-→ **Example:** A worked example or concrete illustration that shows the concept in action.
+→ **What it is:** 3-5 sentences covering what it means and how it works.
+→ **Key details:** Important conditions, formulas, or rules from the document.
+→ **Example:** A worked example showing the concept in action.
 
-After covering all concepts, end with:
+End with:
 
 **TL;DR**
-Write 4-6 sentences summarising the entire document in plain, simple language.
+4-6 sentences summarising the document in plain simple language.
 
 **Likely Exam Topics**
-Based on this document, list 3-5 specific things that are most likely to be tested.
+3-5 things most likely to be tested.
 
 Document:
 {text}""",
@@ -297,6 +287,26 @@ Document:
     print(f"Model ready: {ADAPTER_REPO}")
 
     # --------------------------------------------------------------------------
+    # Stopping criteria
+    # Catches hard repetition loops — same token 15 times in a row
+    # This is different from no_repeat_ngram_size which penalizes ALL repetition
+    # and can distort natural academic language that repeats certain phrases
+    # StopOnRepetition only fires on extreme degeneration (identical tokens)
+    # leaving normal varied output completely untouched
+    # --------------------------------------------------------------------------
+
+    class StopOnRepetition(StoppingCriteria):
+        def __init__(self, threshold=25):
+            self.threshold = threshold
+
+        def __call__(self, input_ids, scores, **kwargs):
+            # If last 15 tokens are all the same — degeneration, stop immediately
+            last_tokens = input_ids[0][-self.threshold:].tolist()
+            return len(set(last_tokens)) == 1
+
+    stopping_criteria = StoppingCriteriaList([StopOnRepetition(threshold=15)])
+
+    # --------------------------------------------------------------------------
     # LangChain setup
     # --------------------------------------------------------------------------
 
@@ -354,6 +364,22 @@ Document:
     # Helper functions
     # --------------------------------------------------------------------------
 
+    def clean_text(text: str) -> str:
+        # Remove Cengage copyright notice from every slide bottom
+        # This was appearing in every ChromaDB chunk and triggering hallucinations
+        text = re.sub(
+            r'@\d{4}\s*Cengage\..*?classroom use\.',
+            '',
+            text,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+        # Remove URLs — trigger model to hallucinate web content
+        text = re.sub(r'http\S+|www\.\S+', '', text)
+        # Clean up extra whitespace left after removals
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r' {2,}', ' ', text)
+        return text.strip()
+
     def truncate_text(text: str, max_tokens: int = MAX_INPUT_TOKENS) -> str:
         token_ids = tokenizer.encode(text, add_special_tokens=False)
         if len(token_ids) <= max_tokens:
@@ -363,29 +389,36 @@ Document:
         return tokenizer.decode(truncated_ids, skip_special_tokens=True)
 
     def generate(messages: list, max_new_tokens: int = MAX_CHAT_TOKENS) -> str:
-        prompt = tokenizer.apply_chat_template(
+        # Matches eval script exactly
+        # eos_token_id — stops when model naturally finishes
+        # stopping_criteria — catches hard loops that eos misses
+        # No repetition_penalty or no_repeat_ngram_size — matches eval script
+        text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        inputs = tokenizer(prompt, return_tensors="pt").to(llm.device)
+        inputs = tokenizer(text, return_tensors="pt").to(llm.device)
         with torch.no_grad():
-            output = llm.generate(
+            out = llm.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 temperature=1.0,
                 pad_token_id=tokenizer.eos_token_id,
-                repetition_penalty=1.5,
-                no_repeat_ngram_size=3,
+                eos_token_id=tokenizer.eos_token_id,
+                stopping_criteria=stopping_criteria,
             )
-        full = tokenizer.decode(output[0], skip_special_tokens=True)
-        prompt_text = tokenizer.decode(inputs["input_ids"][0], skip_special_tokens=True)
-        return full[len(prompt_text):].strip()
+        # Slice new tokens only — same as eval script
+        new_tokens = out[0][inputs["input_ids"].shape[1]:]
+        return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
     def generate_stream(messages: list, max_new_tokens: int = MAX_CHAT_TOKENS):
-        prompt = tokenizer.apply_chat_template(
+        # Matches eval script as closely as possible for streaming
+        # eos_token_id — stops naturally
+        # stopping_criteria — catches hard loops
+        text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        inputs = tokenizer(prompt, return_tensors="pt").to(llm.device)
+        inputs = tokenizer(text, return_tensors="pt").to(llm.device)
         streamer = TextIteratorStreamer(
             tokenizer, skip_prompt=True, skip_special_tokens=True
         )
@@ -396,8 +429,8 @@ Document:
             do_sample=False,
             temperature=1.0,
             pad_token_id=tokenizer.eos_token_id,
-            repetition_penalty=1.5,
-            no_repeat_ngram_size=3,
+            eos_token_id=tokenizer.eos_token_id,
+            stopping_criteria=stopping_criteria,
         )
         thread = Thread(target=llm.generate, kwargs=generation_kwargs)
         thread.start()
@@ -417,23 +450,18 @@ Document:
         for i, chunk in enumerate(chunks):
             print(f"[long doc] Summarizing chunk {i + 1}/{len(chunks)}")
             messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": (
-                    f"Summarize the key points from this section in 3-5 bullet points. "
-                    f"Be concise — each bullet should be one clear sentence.\n\nSection {i + 1}:\n{chunk}"
+                    f"Summarize the key points from section {i + 1} in 3-5 bullet points. "
+                    f"Each bullet should be one clear sentence.\n\n{chunk}"
                 )},
             ]
-            chunk_summary = generate(messages, max_new_tokens=500)
+            chunk_summary = generate(messages, max_new_tokens=300)
             chunk_summaries.append(f"Section {i + 1}:\n{chunk_summary}")
 
-        # Truncate combined summaries to 15000 tokens so the final combine step
-        # never overflows the context window — this was causing the "Network Network" loop
         combined = "\n\n".join(chunk_summaries)
         safe_combined = truncate_text(combined, max_tokens=15000)
-
         prompt_template = SUMMARY_PROMPTS.get(length, SUMMARY_PROMPTS["Medium"])
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt_template.format(text=safe_combined)},
         ]
         return generate(messages, max_new_tokens=MAX_SUMMARY_TOKENS)
@@ -469,7 +497,11 @@ Document:
                         text = page.extract_text()
                         if text:
                             pages_text.append(text)
-                return {"text": "\n\n".join(pages_text)}
+                raw_text = "\n\n".join(pages_text)
+                cleaned_text = clean_text(raw_text)
+                print(f"[extract] Raw: {len(raw_text)} chars → Cleaned: {len(cleaned_text)} chars")
+                print(f"[extract] Preview:\n{cleaned_text[:1000]}")
+                return {"text": cleaned_text}
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"PDF parsing failed: {str(e)}")
         elif filename.endswith((".png", ".jpg", ".jpeg")):
@@ -485,47 +517,44 @@ Document:
 
     @web_app.post("/store", response_model=StoreResponse)
     async def store(request: StoreRequest):
-        existing = vector_store.get(where={"$and": [
-            {"filename": request.filename},
-            {"session_id": request.session_id}
-        ]})
-        if existing and existing.get("ids"):
-            return StoreResponse(chunks_stored=0)
+        existing = vector_store.get(where={"session_id": request.session_id})
+        if existing and existing.get("metadatas"):
+            filenames = [m.get("filename") for m in existing["metadatas"]]
+            if request.filename in filenames:
+                print(f"[store] {request.filename} already stored, skipping")
+                return StoreResponse(chunks_stored=0)
         docs = text_splitter.create_documents(
             texts=[request.text],
             metadatas=[{"filename": request.filename, "session_id": request.session_id}],
         )
         vector_store.add_documents(docs)
+        print(f"[store] Stored {len(docs)} chunks for {request.filename}")
         return StoreResponse(chunks_stored=len(docs))
 
     @web_app.post("/summarize", response_model=SummarizeResponse)
     async def summarize(request: SummarizeRequest):
         prompt_template = SUMMARY_PROMPTS.get(request.length, SUMMARY_PROMPTS["Medium"])
         safe_text = truncate_text(request.text)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt_template.format(text=safe_text)},
-        ]
+        messages = [{"role": "user", "content": prompt_template.format(text=safe_text)}]
         return SummarizeResponse(summary=generate(messages, max_new_tokens=MAX_SUMMARY_TOKENS))
 
     @web_app.post("/summarize/stream")
     async def summarize_stream(request: SummarizeRequest):
         token_count = len(tokenizer.encode(request.text, add_special_tokens=False))
+        print(f"[summarize] Token count: {token_count}")
+        print(f"[summarize] Text preview:\n{request.text[:500]}")
 
         if token_count <= MAX_INPUT_TOKENS:
             prompt_template = SUMMARY_PROMPTS.get(request.length, SUMMARY_PROMPTS["Medium"])
             safe_text = truncate_text(request.text)
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt_template.format(text=safe_text)},
-            ]
+            messages = [{"role": "user", "content": prompt_template.format(text=safe_text)}]
             return StreamingResponse(
                 generate_stream(messages, max_new_tokens=MAX_SUMMARY_TOKENS),
                 media_type="text/plain",
             )
         else:
             num_chunks = (token_count + LONG_DOC_CHUNK_TOKENS - 1) // LONG_DOC_CHUNK_TOKENS
-            print(f"[summarize/stream] Long doc: {token_count} tokens → {num_chunks} chunks")
+            print(f"[summarize] Long doc: {token_count} tokens → {num_chunks} chunks")
 
             def long_doc_stream():
                 yield f"📄 Long document detected ({token_count:,} tokens, ~{num_chunks} sections).\n"
@@ -538,24 +567,29 @@ Document:
     async def chat(request: ChatRequest):
         memory = get_memory(request.session_id)
         retriever = vector_store.as_retriever(
-            search_kwargs={"k": 3, "filter": {"session_id": request.session_id}}
+            search_kwargs={"k": 2, "filter": {"session_id": request.session_id}}
         )
         relevant_docs = retriever.invoke(request.question)
         context = "\n\n".join([doc.page_content for doc in relevant_docs])
+
+        print(f"[chat] Question: {request.question}")
+        print(f"[chat] Context preview:\n{context[:500]}")
+        print(f"[chat] History messages: {len(memory.messages)}")
+
+        recent_messages = memory.messages[-4:] if len(memory.messages) > 4 else memory.messages
         history = "\n".join([
             f"{'User' if m.type == 'human' else 'Assistant'}: {m.content}"
-            for m in memory.messages
+            for m in recent_messages
         ])
+
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": (
-                f"Previous conversation:\n{history}\n\n" if history else ""
-                f"Answer the question using only the context below. "
-                f"If the context doesn't contain enough information to answer, say so.\n\n"
-                f"Context:\n{context}\n\n"
-                f"Question: {request.question}"
+                (f"Earlier in our conversation:\n{history}\n\n" if history else "") +
+                f"Using the document excerpts below, answer this question: {request.question}\n\n"
+                f"Document excerpts:\n{context}"
             )},
         ]
+
         answer = generate(messages, max_new_tokens=MAX_CHAT_TOKENS)
         memory.add_message(HumanMessage(content=request.question))
         memory.add_message(AIMessage(content=answer))
@@ -567,22 +601,26 @@ Document:
     async def chat_stream(request: ChatRequest):
         memory = get_memory(request.session_id)
         retriever = vector_store.as_retriever(
-            search_kwargs={"k": 3, "filter": {"session_id": request.session_id}}
+            search_kwargs={"k": 2, "filter": {"session_id": request.session_id}}
         )
         relevant_docs = retriever.invoke(request.question)
         context = "\n\n".join([doc.page_content for doc in relevant_docs])
+
+        print(f"[chat/stream] Question: {request.question}")
+        print(f"[chat/stream] Context preview:\n{context[:500]}")
+        print(f"[chat/stream] History messages: {len(memory.messages)}")
+
+        recent_messages = memory.messages[-4:] if len(memory.messages) > 4 else memory.messages
         history = "\n".join([
             f"{'User' if m.type == 'human' else 'Assistant'}: {m.content}"
-            for m in memory.messages
+            for m in recent_messages
         ])
+
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": (
-                f"Previous conversation:\n{history}\n\n" if history else ""
-                f"Answer the question using only the context below. "
-                f"If the context doesn't contain enough information to answer, say so.\n\n"
-                f"Context:\n{context}\n\n"
-                f"Question: {request.question}"
+                (f"Earlier in our conversation:\n{history}\n\n" if history else "") +
+                f"Using the document excerpts below, answer this question: {request.question}\n\n"
+                f"Document excerpts:\n{context}"
             )},
         ]
 
