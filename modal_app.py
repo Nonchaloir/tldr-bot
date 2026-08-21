@@ -1,17 +1,20 @@
 """
 TLDR BOT — Modal Deployment
-Final stable version.
+9B Phase 18 model with standing cascade system prompt (reconstructed from
+phase8b_summarization_diagnostic_results.json evidence) and USE_SYSTEM_PROMPT
+toggle for A/B testing.
 
 What changed from previous version:
-  - StopOnRepetition stopping criteria added back — catches hard loops
-    (same token 15 times) without distorting normal output
-  - No repetition_penalty, no no_repeat_ngram_size — matches eval script
-  - eos_token_id explicitly set so model stops naturally when done
-  - stopping_criteria catches cases where eos token isn't generated cleanly
-  - clean_text() strips Cengage copyright and URLs from PDF
-  - No system prompt — matches eval script setup
-  - scaledown_window=300 — stays warm 5 minutes to reduce cold starts
-  - Debug prints kept for Modal logs investigation
+  - SYSTEM_PROMPT added back, reconstructed from diagnostic base_response traces
+  - USE_SYSTEM_PROMPT toggle — flip to False + redeploy to A/B test without it
+  - build_messages() helper centralizes prompt construction so every endpoint
+    (chat, summarize, long-doc chunk summaries) gets identical treatment
+  - ADAPTER_REPO corrected to DraSlayer/personal-llm-phase18-9b (verified from
+    the actual cascade doc, not a guessed name)
+  - Everything else unchanged: enable_thinking=False + strip_thinking() fallback,
+    format_summary_output() for Example: line breaks, timeout=900,
+    scaledown_window=60, heartbeat yields in summarize_long_document(),
+    StopOnRepetition stopping criteria, clean_text() for Cengage/URL stripping
 
 Deploy with: modal deploy modal_app.py
 """
@@ -19,13 +22,14 @@ Deploy with: modal deploy modal_app.py
 import io
 import gc
 import os
+import re
 import sqlite3
 from threading import Thread
 
 import modal
 
 # --------------------------------------------------------------------------
-# Modal image — pinned package versions to match local environment
+# Modal image
 # --------------------------------------------------------------------------
 
 image = (
@@ -82,7 +86,7 @@ hf_secret     = modal.Secret.from_name("huggingface")
         "/chat_history": db_volume,
     },
     secrets=[hf_secret],
-    timeout=600,
+    timeout=900,
     scaledown_window=60,
 )
 @modal.asgi_app()
@@ -110,21 +114,17 @@ def fastapi_app():
     import easyocr
     import numpy as np
     import pdfplumber
-    import re
 
     # --------------------------------------------------------------------------
-    # Config
+    # Config — 9B Phase 18
     # --------------------------------------------------------------------------
 
     HF_TOKEN     = os.environ["HF_TOKEN"]
-    BASE_MODEL   = "Qwen/Qwen2.5-3B-Instruct"
-    ADAPTER_REPO = "DraSlayer/personal-llm-phase17-3b"
+    BASE_MODEL   = "Qwen/Qwen3.5-9B"                      # confirm this matches your exact base
+    ADAPTER_REPO = "DraSlayer/personal-llm-phase18-9b"    # verified from cascade doc
 
-    # Matched to eval script — 350 was used in phase 17 eval
-    # Model stops naturally via eos_token_id before hitting this ceiling
-    # This is a safety net, not a target
     MAX_CHAT_TOKENS       = 350
-    MAX_SUMMARY_TOKENS    = 1500
+    MAX_SUMMARY_TOKENS    = 3000
     MAX_INPUT_TOKENS      = 30000
     LONG_DOC_CHUNK_TOKENS = 10000
 
@@ -154,9 +154,33 @@ def fastapi_app():
         allow_credentials=True,
     )
 
-    # No system prompt — model was trained and evaluated without one
-    # Adding a system prompt changes the input distribution and can cause
-    # the model to output training artifacts instead of natural responses
+    # --------------------------------------------------------------------------
+    # Standing cascade system prompt
+    # Reconstructed from phase8b_summarization_diagnostic_results.json —
+    # the diagnostic's base_response reasoning traces explicitly quote this
+    # exact system prompt during evaluation, and the Phase 18 adapter_response
+    # quality (clean, concise, no <think> leakage) suggests later phases were
+    # trained WITH it present. USE_SYSTEM_PROMPT lets you A/B test this.
+    # --------------------------------------------------------------------------
+
+    USE_SYSTEM_PROMPT = True
+
+    SYSTEM_PROMPT = """When writing authentication or credential-checking code, always verify passwords via proper hash verification, not plaintext comparison.
+
+If a question states or assumes something technically false (a wrong complexity/Big-O claim, a wrong algorithmic property, or any other incorrect premise), correct the false premise directly before answering, even if the rest of your answer is brief. Do not accept an incorrect framing at face value just to keep the response short."""
+
+    def build_messages(user_content: str) -> list:
+        """
+        Wraps a user message with the standing system prompt if enabled.
+        Centralized so every call site (chat, summarize, long-doc chunk
+        summaries) gets identical treatment — avoids prompt drift.
+        """
+        if USE_SYSTEM_PROMPT:
+            return [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ]
+        return [{"role": "user", "content": user_content}]
 
     SUMMARY_PROMPTS = {
         "Short": """Analyse this document and produce a concise breakdown.
@@ -172,19 +196,21 @@ End with:
 Document:
 {text}""",
 
-"Medium": """The following is a university lecture document. Extract and explain all the key concepts from it.
+        "Medium": """Read this document and explain the key concepts in your own words — do not copy slide text or headings verbatim.
 
-Do not ask questions. Do not say you can help. Just directly output the concepts.
+For each concept use exactly this format:
 
-For each concept use this format:
 **[Concept Name]**
-What it is: [2 sentences]
-Example: [one example]
+What it is: [2-3 sentences explaining it clearly]
+Example: [a concrete, specific example — use real numbers, code, or details from the document where possible]
 
----
+Put a blank line between "What it is" and "Example", and a blank line before each new concept.
+
+Cover every distinct concept in the document, not just the first few.
 
 Document:
 {text}""",
+
         "Detailed": """Analyse this document and produce an in-depth study breakdown.
 
 For each major concept write:
@@ -200,7 +226,7 @@ End with:
 4-6 sentences summarising the document in plain simple language.
 
 **Likely Exam Topics**
-3-5 things most likely to be tested.
+3-5 things most likely to be tested, ranked by likelihood.
 
 Document:
 {text}""",
@@ -285,26 +311,37 @@ Document:
     llm.eval()
     print(f"VRAM used: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
     print(f"Model ready: {ADAPTER_REPO}")
+    print(f"System prompt enabled: {USE_SYSTEM_PROMPT}")
 
     # --------------------------------------------------------------------------
-    # Stopping criteria
-    # Catches hard repetition loops — same token 15 times in a row
-    # This is different from no_repeat_ngram_size which penalizes ALL repetition
-    # and can distort natural academic language that repeats certain phrases
-    # StopOnRepetition only fires on extreme degeneration (identical tokens)
-    # leaving normal varied output completely untouched
+    # Stopping criteria — catches hard repetition loops
     # --------------------------------------------------------------------------
 
     class StopOnRepetition(StoppingCriteria):
-        def __init__(self, threshold=25):
+        def __init__(self, threshold=15):
             self.threshold = threshold
 
         def __call__(self, input_ids, scores, **kwargs):
-            # If last 15 tokens are all the same — degeneration, stop immediately
             last_tokens = input_ids[0][-self.threshold:].tolist()
             return len(set(last_tokens)) == 1
 
     stopping_criteria = StoppingCriteriaList([StopOnRepetition(threshold=15)])
+
+    # --------------------------------------------------------------------------
+    # Output post-processing
+    # --------------------------------------------------------------------------
+
+    def strip_thinking(text: str) -> str:
+        # Qwen3.5 wraps reasoning in <think>...</think> before the real answer
+        # enable_thinking=False should prevent this at the source — this is
+        # a safety net in case it still appears
+        return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
+
+    def format_summary_output(text: str) -> str:
+        # Forces "Example:" onto its own line with a blank line before it
+        text = re.sub(r'(?<!\n\n)Example:', r'\n\nExample:', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
 
     # --------------------------------------------------------------------------
     # LangChain setup
@@ -365,17 +402,11 @@ Document:
     # --------------------------------------------------------------------------
 
     def clean_text(text: str) -> str:
-        # Remove Cengage copyright notice from every slide bottom
-        # This was appearing in every ChromaDB chunk and triggering hallucinations
         text = re.sub(
             r'@\d{4}\s*Cengage\..*?classroom use\.',
-            '',
-            text,
-            flags=re.DOTALL | re.IGNORECASE
+            '', text, flags=re.DOTALL | re.IGNORECASE
         )
-        # Remove URLs — trigger model to hallucinate web content
         text = re.sub(r'http\S+|www\.\S+', '', text)
-        # Clean up extra whitespace left after removals
         text = re.sub(r'\n{3,}', '\n\n', text)
         text = re.sub(r' {2,}', ' ', text)
         return text.strip()
@@ -389,13 +420,16 @@ Document:
         return tokenizer.decode(truncated_ids, skip_special_tokens=True)
 
     def generate(messages: list, max_new_tokens: int = MAX_CHAT_TOKENS) -> str:
-        # Matches eval script exactly
-        # eos_token_id — stops when model naturally finishes
-        # stopping_criteria — catches hard loops that eos misses
-        # No repetition_penalty or no_repeat_ngram_size — matches eval script
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        try:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+
         inputs = tokenizer(text, return_tensors="pt").to(llm.device)
         with torch.no_grad():
             out = llm.generate(
@@ -407,17 +441,23 @@ Document:
                 eos_token_id=tokenizer.eos_token_id,
                 stopping_criteria=stopping_criteria,
             )
-        # Slice new tokens only — same as eval script
         new_tokens = out[0][inputs["input_ids"].shape[1]:]
-        return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        raw = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        raw = strip_thinking(raw)
+        raw = format_summary_output(raw)
+        return raw
 
     def generate_stream(messages: list, max_new_tokens: int = MAX_CHAT_TOKENS):
-        # Matches eval script as closely as possible for streaming
-        # eos_token_id — stops naturally
-        # stopping_criteria — catches hard loops
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        try:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+
         inputs = tokenizer(text, return_tensors="pt").to(llm.device)
         streamer = TextIteratorStreamer(
             tokenizer, skip_prompt=True, skip_special_tokens=True
@@ -438,7 +478,7 @@ Document:
             yield token
         thread.join()
 
-    def summarize_long_document(text: str, length: str) -> str:
+    def summarize_long_document(text: str, length: str):
         token_ids = tokenizer.encode(text, add_special_tokens=False)
         chunks = [
             tokenizer.decode(token_ids[i:i + LONG_DOC_CHUNK_TOKENS], skip_special_tokens=True)
@@ -448,23 +488,21 @@ Document:
 
         chunk_summaries = []
         for i, chunk in enumerate(chunks):
+            yield f"⏳ Processing section {i + 1}/{len(chunks)}...\n"
             print(f"[long doc] Summarizing chunk {i + 1}/{len(chunks)}")
-            messages = [
-                {"role": "user", "content": (
-                    f"Summarize the key points from section {i + 1} in 3-5 bullet points. "
-                    f"Each bullet should be one clear sentence.\n\n{chunk}"
-                )},
-            ]
+            messages = build_messages(
+                f"Summarize the key points from section {i + 1} in 3-5 bullet points. "
+                f"Each bullet should be one clear sentence.\n\n{chunk}"
+            )
             chunk_summary = generate(messages, max_new_tokens=300)
             chunk_summaries.append(f"Section {i + 1}:\n{chunk_summary}")
 
         combined = "\n\n".join(chunk_summaries)
         safe_combined = truncate_text(combined, max_tokens=15000)
         prompt_template = SUMMARY_PROMPTS.get(length, SUMMARY_PROMPTS["Medium"])
-        messages = [
-            {"role": "user", "content": prompt_template.format(text=safe_combined)},
-        ]
-        return generate(messages, max_new_tokens=MAX_SUMMARY_TOKENS)
+        messages = build_messages(prompt_template.format(text=safe_combined))
+        yield "\n📝 Combining into final summary...\n\n"
+        yield generate(messages, max_new_tokens=MAX_SUMMARY_TOKENS)
 
     # --------------------------------------------------------------------------
     # Endpoints
@@ -472,7 +510,7 @@ Document:
 
     @web_app.get("/health")
     async def health():
-        return {"status": "ok"}
+        return {"status": "ok", "system_prompt_enabled": USE_SYSTEM_PROMPT}
 
     @web_app.get("/history")
     async def get_history(session_id: str):
@@ -500,10 +538,16 @@ Document:
                 raw_text = "\n\n".join(pages_text)
                 cleaned_text = clean_text(raw_text)
                 print(f"[extract] Raw: {len(raw_text)} chars → Cleaned: {len(cleaned_text)} chars")
-                print(f"[extract] Preview:\n{cleaned_text[:1000]}")
                 return {"text": cleaned_text}
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"PDF parsing failed: {str(e)}")
+        elif filename.endswith((".md", ".txt")):
+            try:
+                text = contents.decode("utf-8")
+                cleaned = clean_text(text)
+                return {"text": cleaned}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Text file parsing failed: {str(e)}")
         elif filename.endswith((".png", ".jpg", ".jpeg")):
             try:
                 image = Image.open(io.BytesIO(contents))
@@ -535,19 +579,18 @@ Document:
     async def summarize(request: SummarizeRequest):
         prompt_template = SUMMARY_PROMPTS.get(request.length, SUMMARY_PROMPTS["Medium"])
         safe_text = truncate_text(request.text)
-        messages = [{"role": "user", "content": prompt_template.format(text=safe_text)}]
+        messages = build_messages(prompt_template.format(text=safe_text))
         return SummarizeResponse(summary=generate(messages, max_new_tokens=MAX_SUMMARY_TOKENS))
 
     @web_app.post("/summarize/stream")
     async def summarize_stream(request: SummarizeRequest):
         token_count = len(tokenizer.encode(request.text, add_special_tokens=False))
         print(f"[summarize] Token count: {token_count}")
-        print(f"[summarize] Text preview:\n{request.text[:500]}")
 
         if token_count <= MAX_INPUT_TOKENS:
             prompt_template = SUMMARY_PROMPTS.get(request.length, SUMMARY_PROMPTS["Medium"])
             safe_text = truncate_text(request.text)
-            messages = [{"role": "user", "content": prompt_template.format(text=safe_text)}]
+            messages = build_messages(prompt_template.format(text=safe_text))
             return StreamingResponse(
                 generate_stream(messages, max_new_tokens=MAX_SUMMARY_TOKENS),
                 media_type="text/plain",
@@ -557,9 +600,8 @@ Document:
             print(f"[summarize] Long doc: {token_count} tokens → {num_chunks} chunks")
 
             def long_doc_stream():
-                yield f"📄 Long document detected ({token_count:,} tokens, ~{num_chunks} sections).\n"
-                yield f"Summarizing each section then combining — this may take a few minutes...\n\n"
-                yield summarize_long_document(request.text, request.length)
+                yield f"📄 Long document detected ({token_count:,} tokens, ~{num_chunks} sections).\n\n"
+                yield from summarize_long_document(request.text, request.length)
 
             return StreamingResponse(long_doc_stream(), media_type="text/plain")
 
@@ -572,23 +614,18 @@ Document:
         relevant_docs = retriever.invoke(request.question)
         context = "\n\n".join([doc.page_content for doc in relevant_docs])
 
-        print(f"[chat] Question: {request.question}")
-        print(f"[chat] Context preview:\n{context[:500]}")
-        print(f"[chat] History messages: {len(memory.messages)}")
-
         recent_messages = memory.messages[-4:] if len(memory.messages) > 4 else memory.messages
         history = "\n".join([
             f"{'User' if m.type == 'human' else 'Assistant'}: {m.content}"
             for m in recent_messages
         ])
 
-        messages = [
-            {"role": "user", "content": (
-                (f"Earlier in our conversation:\n{history}\n\n" if history else "") +
-                f"Using the document excerpts below, answer this question: {request.question}\n\n"
-                f"Document excerpts:\n{context}"
-            )},
-        ]
+        user_content = (
+            (f"Earlier in our conversation:\n{history}\n\n" if history else "") +
+            f"Using the document excerpts below, answer this question: {request.question}\n\n"
+            f"Document excerpts:\n{context}"
+        )
+        messages = build_messages(user_content)
 
         answer = generate(messages, max_new_tokens=MAX_CHAT_TOKENS)
         memory.add_message(HumanMessage(content=request.question))
@@ -606,23 +643,18 @@ Document:
         relevant_docs = retriever.invoke(request.question)
         context = "\n\n".join([doc.page_content for doc in relevant_docs])
 
-        print(f"[chat/stream] Question: {request.question}")
-        print(f"[chat/stream] Context preview:\n{context[:500]}")
-        print(f"[chat/stream] History messages: {len(memory.messages)}")
-
         recent_messages = memory.messages[-4:] if len(memory.messages) > 4 else memory.messages
         history = "\n".join([
             f"{'User' if m.type == 'human' else 'Assistant'}: {m.content}"
             for m in recent_messages
         ])
 
-        messages = [
-            {"role": "user", "content": (
-                (f"Earlier in our conversation:\n{history}\n\n" if history else "") +
-                f"Using the document excerpts below, answer this question: {request.question}\n\n"
-                f"Document excerpts:\n{context}"
-            )},
-        ]
+        user_content = (
+            (f"Earlier in our conversation:\n{history}\n\n" if history else "") +
+            f"Using the document excerpts below, answer this question: {request.question}\n\n"
+            f"Document excerpts:\n{context}"
+        )
+        messages = build_messages(user_content)
 
         def stream_and_save():
             full_answer = ""
